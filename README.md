@@ -1,187 +1,130 @@
-SHL Assessment Recommender
+# SHL Assessment Recommender
 
-Conversational AI agent for recommending SHL Individual Test Solutions
+Conversational recommender for SHL Individual Test Solutions.
 
-Author: Radhika Sharda
-Assignment: SHL Labs – AI Intern Role
+**Author:** Radhika Sharda · **Assignment:** SHL Labs – AI Intern Role
+**Live endpoint:** https://recommender-3-ki1j.onrender.com
 
-1. Problem Statement
+---
 
-Hiring managers often struggle to identify the correct SHL assessments for a specific role, level, or skill requirement.
+## What this is
 
-The objective of this project is to build a conversational AI system that:
+A FastAPI service that exposes two endpoints — `GET /health` and `POST /chat` — and returns a grounded shortlist of SHL Individual Test Solutions in the schema required by the assignment evaluator.
 
-Recommends only valid SHL Individual Test Solutions
-Never hallucinates assessment names or URLs
-Grounds all recommendations in a structured internal catalog
-Produces structured JSON output suitable for automated evaluation
-2. System Overview
+The recommender is **rule-based**: no LLM is in the runtime path. Retrieval is a hand-curated, tag-scored lookup over a static catalog. The design rationale and trade-offs are in [`APPROACH.md`](./APPROACH.md).
 
-This is a stateless FastAPI-based conversational agent that uses Claude (Anthropic) as the reasoning engine, with a strictly controlled system prompt and post-validation layer.
+## Why rule-based
 
-Core Design Principles
-Strict grounding to in-memory catalog
-Zero hallucination tolerance
-Structured JSON output enforcement
-Turn-cap conversation management
-Prompt injection resistance
-3. Architecture
-Client
-   │
-   ▼
+- **Zero hallucination by construction** — every URL returned comes from the static catalog. The rubric's *"% of turns with hallucinations"* probe is zero by design.
+- **Predictable latency** — <50ms warm, no LLM round-trip risk inside the 30s evaluator timeout.
+- **Catalog is small (41 products)** — vector retrieval would add latency without measurably improving recall over hand-curated tags at this size.
+
+The trade-off — weaker conversational behaviors on refinement, comparison, and robust refusal — is documented honestly in `APPROACH.md` §3.
+
+## Architecture
+
+```
 POST /chat
    │
    ▼
-FastAPI Backend
-   │
-   ├── System Prompt + Catalog Injection
-   │
-   ▼
-Claude (Anthropic API)
+FastAPI handler (main.py)
+   │   • role validation
+   │   • turn cap (≥8 messages → end_of_conversation: true)
+   │   • keyword refusal (legal / salary)
    │
    ▼
-JSON Parsing + Validation Layer
+search_products(latest_user_message)   ← catalog_data.py
+   │   • tag-word match  +3
+   │   • name-word match +2
+   │   • description-word match (>3 chars) +1
+   │   • optional job_levels / test_types / job_families filters
    │
    ▼
-Validated Structured Response
-4. Key Technical Decisions
-1. Stateless Conversation Design
+Top-5 recommendations + reply + end_of_conversation
+```
 
-The /chat endpoint requires full conversation history in every request.
+## API
 
-This ensures:
+### `GET /health`
 
-No server-side memory complexity
-Easy scaling
-Deterministic evaluation behavior
-2. Catalog Grounding Strategy
+```json
+{ "status": "ok" }
+```
 
-The entire SHL product catalog is:
+### `POST /chat`
 
-Loaded in-process (catalog_data.py)
-Injected into the system prompt
-Validated post-response
+**Request:**
 
-Even if the model attempts hallucination, the validation layer drops invalid entries.
-
-3. JSON-Only Response Enforcement
-
-The system prompt strictly mandates:
-
-{
-  "reply": "...",
-  "recommendations": [...],
-  "end_of_conversation": false
-}
-
-The backend:
-
-Strips markdown fences
-Attempts fallback JSON extraction
-Validates URLs and names against catalog
-Enforces maximum of 10 recommendations
-4. Hallucination Safeguards
-
-Recommendations are accepted only if:
-
-URL matches catalog exactly
-OR name matches catalog and canonical URL is substituted
-
-Anything else is dropped.
-
-5. Conversation Turn Cap
-
-Hard cap of 8 total turns (user + assistant).
-
-Prevents:
-
-Infinite loops
-Token explosion
-Runaway API cost
-5. API Endpoints
-Health Check
-GET /health
-
-Response:
-
-{"status": "ok"}
-Chat Endpoint
-POST /chat
-Content-Type: application/json
-
-Request format:
-
+```json
 {
   "messages": [
-    {
-      "role": "user",
-      "content": "Assessment for entry-level data analyst"
-    }
+    {"role": "user", "content": "Hiring a Java developer who works with stakeholders"},
+    {"role": "assistant", "content": "Sure. What is seniority level?"},
+    {"role": "user", "content": "Mid-level, around 4 years"}
   ]
 }
+```
 
-Response format:
+**Response:**
 
+```json
 {
-  "reply": "Here are recommended assessments...",
+  "reply": "Here are the most relevant SHL assessments based on your requirements.",
   "recommendations": [
-    {
-      "name": "Verify Numerical Ability Test",
-      "url": "https://...",
-      "test_type": "A"
-    }
+    {"name": "Java 8 (New)", "url": "https://www.shl.com/...", "test_type": "K"}
   ],
-  "end_of_conversation": false
+  "end_of_conversation": true
 }
-6. Deployment
+```
 
-Hosted on Render (Free Tier).
+`recommendations` is `[]` when the agent is clarifying or refusing. `end_of_conversation` is `true` once a shortlist has been committed (matches the evaluator's note that the simulated user ends the conversation when given a shortlist) or when the 8-turn cap is hit.
 
-Base URL:
+## Local setup
 
-https://recommender-3-ki1j.onrender.com
-
-Note: First request may take 20–40 seconds due to cold start behavior on free hosting.
-
-7. Local Setup
-1. Clone Repository
+```bash
 git clone https://github.com/Radhika-SHARDA/Recommender.git
 cd Recommender
-2. Create Virtual Environment
-python -m venv venv
-source venv/bin/activate   # Mac/Linux
-venv\Scripts\activate      # Windows
-3. Install Dependencies
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-4. Set Environment Variable
-
-You must set your Anthropic API key:
-
-Mac/Linux:
-
-export ANTHROPIC_API_KEY=your_api_key_here
-
-Windows:
-
-set ANTHROPIC_API_KEY=your_api_key_here
-5. Run Server
 uvicorn main:app --host 0.0.0.0 --port 8000
-8. Security & Robustness Considerations
-API key stored in environment variables only
-No secrets committed to repository
-Input role validation
-Strict output schema enforcement
-Prompt injection resistance via system prompt constraints
-Defensive JSON parsing with fallback
-9. Limitations
-Relies on external LLM availability
-Free-tier hosting introduces cold starts
-Large catalog injection increases token usage
-No streaming response optimization
-10. Future Improvements
-Tool-calling instead of prompt-only grounding
-Embedding-based semantic retrieval instead of full catalog injection
-Rate limiting
-Streaming responses
-Response caching layer
-Observability and metrics logging
+```
+
+No API keys, no environment variables. The catalog ships in `catalog_data.py`.
+
+## Tests
+
+```bash
+# against local server
+python test_agent.py
+
+# against the deployed endpoint
+BASE_URL=https://recommender-3-ki1j.onrender.com python test_agent.py
+```
+
+`test_agent.py` runs 11 probes covering schema, turn cap, vague-query handling, catalog-URL validation, refinement, off-topic refusal, prompt-injection, comparison, and JD parsing. See `APPROACH.md` §4 for which probes pass and which surface known design gaps.
+
+`test_agent.py` requires the `requests` library (`pip install requests`); it's not in `requirements.txt` because the deployed service doesn't need it.
+
+## Deployment
+
+Render free tier. Cold start adds 20–40s on the first request after idle; subsequent requests are fast. The `/health` endpoint is intentionally trivial so the evaluator can warm the dyno before scoring.
+
+## Repo layout
+
+```
+main.py              FastAPI service (2 endpoints, ~130 lines)
+catalog_data.py      41-product catalog + search_products scorer
+test_agent.py        11 local probes against /chat
+requirements.txt     fastapi, uvicorn, pydantic, httpx
+APPROACH.md          2-page design doc — read this first
+```
+
+## Honest limitations
+
+These are real, known, and not hidden in the approach doc:
+
+- **Refinement is single-turn.** Only the latest user message is fed to retrieval.
+- **Comparison is not implemented.** *"Difference between OPQ and GSA?"* routes through the same search path.
+- **Refusal is keyword-only** (`legal` / `salary`). Paraphrased off-topic queries and prompt-injection can leak through.
+
+The next-step architecture (rule-based pre-filter + small LLM final-write step) is sketched in `APPROACH.md` §5.
