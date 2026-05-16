@@ -1,7 +1,7 @@
 """
 SHL Individual Test Solutions Catalog
 Sourced from https://www.shl.com/solutions/products/product-catalog/ (type=1)
-This module contains the catalog and provides a scraper for live updates.
+This module contains the static catalog and a tag-based search_products() scorer.
 """
 
 # Comprehensive SHL Individual Test Solutions catalog
