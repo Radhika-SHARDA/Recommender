@@ -1,88 +1,70 @@
-# Approach Document — SHL Conversational Assessment Recommender
-**Candidate:** Radhika Sharda | **Role:** AI Intern, SHL Labs
+# Approach — SHL Conversational Assessment Recommender
+
+**Candidate:** Radhika Sharda · **Role:** AI Intern, SHL Labs
+**Repo:** github.com/Radhika-SHARDA/Recommender · **Endpoint:** recommender-3-ki1j.onrender.com
 
 ---
 
-## 1. Problem Decomposition
+## 1. Design choice and trade-off
 
-The core challenge is turning a vague, open-ended hiring intent into a grounded shortlist of SHL assessments — without hallucinating products that do not exist in the catalog. This requires three things to work together: a reliable data layer (the catalog), a reasoning layer (the LLM), and a guardrail layer (output validation).
+I built a **rule-based recommender, not an LLM agent**. Three reasons:
 
-I decomposed the problem into four sub-problems:
-1. **Catalog acquisition** — scrape and structure the SHL Individual Test Solutions catalog.
-2. **Agent behavior** — clarify, recommend, refine, compare, and refuse correctly.
-3. **Stateless API design** — receive full conversation history, return structured JSON.
-4. **Hallucination prevention** — every URL and name must come from the catalog, validated post-generation.
+1. **Hallucination is the rubric's most-penalised failure** — every URL must come from the catalog, and one behavior probe is *"% of turns with hallucinations."* A static catalog plus deterministic scoring gives a hallucination rate of zero by construction.
+2. **30-second timeout with Render cold starts.** An LLM round-trip plus a JSON-parse retry is risky inside that budget; the rule-based path returns in <50 ms warm.
+3. **The catalog is small (41 Individual Test Solutions).** A vector store would add latency and operational surface without measurably improving recall over hand-curated tags at this size.
 
----
+**The trade-off I made explicit:** I am strong on the **hard evals** (schema, catalog-only URLs, turn cap, hallucination) and **weaker on the conversational behaviors** that benefit from generative language — multi-turn refinement and natural-language comparison. Section 3 lists those gaps without softening them.
 
-## 2. Catalog Strategy
+## 2. Catalog and retrieval
 
-The SHL product catalog renders via JavaScript, making static HTML scraping insufficient. My approach:
+`catalog_data.py` holds 41 Individual Test Solutions as a list of typed dicts. Each row carries: name, URL, description, `test_type` (single-letter SHL codes — A, B, D, K, P, S are used in this catalog; four products are multi-typed), remote-testing and adaptive-IRT flags, job levels, languages, job families, and a hand-curated **tag list** averaging ~7 tags per product (e.g. `["java","backend","oop","spring"]` for Java 8).
 
-- **Primary**: A `catalog_data.py` module containing 35+ manually curated Individual Test Solution entries with names, URLs, descriptions, test types, job levels, languages, job families, and semantic tags.
-- **Sourcing**: Product pages accessed via `web_fetch` during development; each entry cross-referenced against the official SHL catalog pages (e.g., `shl.com/solutions/products/product-catalog/view/...`).
-- **Deployed enrichment**: The production service includes a background scraper using Playwright that refreshes the catalog daily via the paginated catalog URL (`?start=0&type=1`) — tolerating cold starts gracefully by serving the static catalog if the scrape fails.
+The tags are the workhorse. `search_products(query)` scores each item:
 
-The catalog is structured as a Python list of typed dicts, making it easy to search, filter, and inject into prompts without a vector database (appropriate for ~200 products). A simple tag-based scoring function (`search_products`) pre-filters candidates before LLM reasoning.
+- **+3** for any tag matching a word in the query (or substring match either direction)
+- **+2** for a name-word match
+- **+1** for description-word match (words >3 chars only, to suppress stopwords)
+- Optional `job_levels` / `test_types` / `job_families` filters zero-out or down-rank misses
 
----
+Sorted descending, top 10 returned. ~30 lines, fully defensible at the deep-dive: I know exactly why a given product ranks where it does, and edits are localised (add a tag → re-rank a product).
 
-## 3. Agent Design
+## 3. Agent behavior — what works, and what is a known gap
 
-**Model**: `claude-sonnet-4-20250514` — fast enough for 30-second timeouts, capable enough for multi-turn structured reasoning.
+`POST /chat` is stateless. On each call it:
 
-**Context engineering**: The entire catalog (name, URL, type, levels, tags, 200-char description) is injected into the system prompt on every request. This ensures the model always has ground truth and never relies on prior training knowledge about SHL products. At ~35 products × ~80 tokens each, this fits comfortably in the context window and avoids retrieval latency.
+1. Validates schema (role ∈ {user, assistant}, non-empty messages).
+2. Enforces the **turn cap** at ≥8 messages → returns `end_of_conversation: true` with empty recommendations.
+3. Runs a **keyword refusal** for "legal" / "salary" in the latest message.
+4. Runs `search_products` on the **latest user message** and returns the top 5 as recommendations with `end_of_conversation: true`.
+5. **Clarify fallback**: if search returns nothing, returns a clarifying question with empty recommendations.
 
-**Behavioral instructions** in the system prompt explicitly define four states:
-- *Clarify*: ask one focused question when intent is ambiguous (role, level, or skill area is unknown).
-- *Recommend*: return 1–10 catalog items once sufficient context exists; include JD parsing.
-- *Refine*: treat constraint changes as shortlist updates, not conversation restarts.
-- *Compare*: answer from catalog descriptions only — no model priors.
+I am being upfront about four known gaps rather than dressing them up:
 
-**Turn cap**: A hard check at 8 messages returns `end_of_conversation: true`, preventing runaway conversations.
+- **Refinement is single-turn.** Only `messages[-1]` is fed to retrieval. *"Actually, add personality tests"* works only because "personality" matches type-P tags directly; the prior shortlist isn't extended. One-line fix (concatenate user turns with decaying weight), deferred for time.
+- **Comparison is not implemented.** *"Difference between OPQ and GSA?"* routes through the same search path. A grounded answer needs either a templated diff over the two products' structured fields, or an LLM with the two records injected. The templated-diff version is the first thing I'd add.
+- **Refusal is keyword-based and narrow.** Catches the explicit legal/salary case but paraphrased off-topic queries or prompt-injection can leak through. A score-based gate (zero retrieval signal → refuse) would close most of this.
+- **`end_of_conversation: true` on the first shortlist** is intentional — the spec notes the simulated user ends the conversation when given a shortlist — but it forecloses in-conversation refinement.
 
-**Refusal**: The system prompt instructs the model to decline off-topic queries (legal, HR general, prompt injections) and return empty recommendations.
+## 4. Evaluation
 
----
+`test_agent.py` (160 lines) runs 11 probes against the deployed endpoint: schema compliance, turn cap, vague-query handling, catalog-URL validation, refinement, off-topic refusal, prompt-injection, comparison, and JD parsing.
 
-## 4. Output Validation & Hallucination Prevention
+Honest results on the deployed service:
 
-Claude is instructed to output raw JSON with no markdown fences. A post-generation validator (`_parse_agent_response`):
-1. Strips any accidental code fences.
-2. Parses JSON, falling back to regex extraction on failure.
-3. Checks every recommendation URL and name against the catalog's canonical set.
-4. Drops any item not found in the catalog (silent guardrail).
-5. Fixes URLs when a correct name is returned with a wrong URL.
+- **Hard-eval probes pass** — schema, catalog-only URLs, turn cap, JD parsing, basic recommendation.
+- **Behavior probes that depend on multi-turn reasoning or generated prose** — refinement edge cases, the comparison reply, robust refusal of injection — **fail or pass-by-accident**. These are real gaps from Section 3, not test bugs.
 
-This means even if Claude hallucinates an assessment name, it will be silently removed from the response — the evaluator never sees a non-catalog URL.
+I did not run the 10 public conversation traces through the harness format end-to-end. The realistic expectation: high Recall@10 on queries whose vocabulary overlaps my tags (Java, sales, customer service, cognitive, personality, IT roles), and lower recall on paraphrased or domain-shifted queries because tag matching does not generalise.
 
----
+## 5. What didn't work / what I would do next
 
-## 5. Evaluation Approach
+- **First fix: rule-based retrieval as a pre-filter for an LLM final-write step.** The keyword scorer narrows 41 items to ~10 candidates; the LLM picks the final 1–10 and writes the reply with the candidate list injected as ground truth. This splits the latency budget cleanly, keeps hallucination at zero (URLs only from the pre-filter), and unlocks proper Clarify / Refine / Compare behaviors.
+- **Conversation-aware retrieval** — concatenate user turns (skip assistant turns) with decaying weight before scoring. Cheap, no architecture change, immediately fixes the refinement probe.
+- **Templated comparison route** — pattern-match *"difference between X and Y"*, resolve X and Y to catalog rows, return a structured diff over `test_type`, `job_levels`, `description`. No LLM required.
+- **Score-based refusal gate** replacing keyword refusal — if the top retrieval score is below a threshold and no SHL-specific entities are in the query, refuse instead of clarifying.
 
-**Hard evals (local)**: `test_agent.py` runs 11 automated test cases covering schema compliance, turn cap, vague-query behavior, catalog-URL validation, refinement, off-topic refusal, prompt injection, comparison, and JD parsing.
+## 6. Stack and AI tooling
 
-**Recall@10 strategy**: By injecting the full catalog and using rich tags (e.g., `["Java","backend","developer","Spring","OOP"]`) I maximise the model's ability to match queries to the right products. For holdout traces, the tag vocabulary covers common hiring scenarios (IT roles, sales, customer service, management, safety, healthcare).
+FastAPI + Uvicorn + Pydantic; Python module catalog; deployed on Render free tier. **No vector DB, no LLM in the runtime path** — both deliberate, both defensible at the deep-dive.
 
-**What didn't work**:
-- *Vector search (FAISS)*: tested sentence-transformer embeddings over the catalog. The catalog is small enough (~35 items) that embedding search added 2–3 seconds of latency with no measurable recall improvement over tag-based scoring + LLM reasoning.
-- *Tool-use / function calling*: tried exposing `search_catalog` as a Claude tool. This added a second round-trip (~5–8 seconds) and increased timeout risk. In-prompt catalog injection proved faster and more reliable within the 30-second budget.
-- *Streaming*: FastAPI streaming complicated the JSON parsing. Switched to synchronous `messages.create` for schema reliability.
-
----
-
-## 6. Stack & Deployment
-
-| Layer | Choice | Reason |
-|---|---|---|
-| LLM | Claude claude-sonnet-4-20250514 (Anthropic) | Assignment used Anthropic SDK; best cost/quality/latency |
-| API framework | FastAPI + Uvicorn | Fast, Pydantic schema validation built-in |
-| Catalog storage | In-process Python module | No DB latency; small enough catalog |
-| Deployment | Render (free web service) | Simple `render.yaml` config; auto-deploy from GitHub |
-| Testing | `requests` + custom assertions | Lightweight, no framework overhead |
-
-**AI tools used**: Claude Sonnet assisted with boilerplate generation for the FastAPI models and test stubs. All design decisions, system prompt design, and guardrail logic were written and reasoned through by hand.
-
----
-
-*Total lines of production code: ~400 (main.py + catalog_data.py). Test file: ~160 lines.*
+**AI tools used:** Claude assisted with scaffolding the FastAPI boilerplate and Pydantic models, and with expanding the tag vocabulary on individual catalog entries from their SHL descriptions. The retrieval scoring, the routing logic, the trade-off framing above, and the test suite were written by hand.
