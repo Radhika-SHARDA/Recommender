@@ -1,7 +1,7 @@
 """
 SHL Individual Test Solutions Catalog
 Sourced from https://www.shl.com/solutions/products/product-catalog/ (type=1)
-This module contains the static catalog and a tag-based search_products() scorer.
+This module contains the static catalog and a tag-based search_products() scorer used as the retrieval step in front of the LLM.
 """
 
 # Comprehensive SHL Individual Test Solutions catalog
